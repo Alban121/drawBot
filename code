@@ -1,0 +1,581 @@
+#include <Arduino.h>
+#include "BluetoothSerial.h"
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <math.h>
+
+#if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
+#error Bluetooth is not enabled! Please run `make menuconfig` to enable it
+#endif
+
+BluetoothSerial SerialBT;
+
+// Configuration WiFi - point d'accès
+const char* ssid = "DrawBot-WiFi";
+const char* password = "12345678";
+
+WebServer server(80);
+
+// Pins définition
+#define LEDU1 25
+#define LEDU2 26
+#define EN_D 23
+#define EN_G 4
+#define IN_1_D 19
+#define IN_2_D 18
+#define IN_1_G 17
+#define IN_2_G 16
+
+// Pins encodeurs
+#define ENC_G_CH_A 32
+#define ENC_G_CH_B 33
+#define ENC_D_CH_A 27
+#define ENC_D_CH_B 14
+
+// Pins I2C
+#define SDA 21
+#define SCL 22
+#define ADDR_IMU 0x6B
+#define ADDR_MAG 0x1E
+
+// Variables encodeurs
+volatile long encoderDCount = 0;
+volatile long encoderGCount = 0;
+
+// Constantes physiques du robot
+const float WHEEL_DIAMETER = 9.0;        // Diamètre roue en cm
+const float WHEEL_CIRCUMFERENCE = PI * WHEEL_DIAMETER;  // Circonférence roue
+const float WHEEL_BASE = 13.0;           // Distance entre roues en cm
+const int PULSES_PER_REV = 360;          // Impulsions par révolution encodeur (à ajuster)
+const float CM_PER_PULSE = WHEEL_CIRCUMFERENCE / PULSES_PER_REV;
+
+// Variables de contrôle
+bool isExecuting = false;
+
+// Fonctions d'interruption encodeurs
+void IRAM_ATTR encoderDISR() {
+  encoderDCount++;
+}
+
+void IRAM_ATTR encoderGISR() {
+  encoderGCount++;
+}
+
+// Fonctions contrôle moteurs
+void setMotorSpeed(int leftSpeed, int rightSpeed) {
+  leftSpeed = constrain(leftSpeed, -255, 255);
+  rightSpeed = constrain(rightSpeed, -255, 255);
+  
+  // Moteur gauche
+  if (leftSpeed > 0) {
+    digitalWrite(IN_1_G, HIGH);
+    digitalWrite(IN_2_G, LOW);
+  } else if (leftSpeed < 0) {
+    digitalWrite(IN_1_G, LOW);
+    digitalWrite(IN_2_G, HIGH);
+  } else {
+    digitalWrite(IN_1_G, LOW);
+    digitalWrite(IN_2_G, LOW);
+  }
+  analogWrite(EN_G, abs(leftSpeed));
+  
+  // Moteur droit
+  if (rightSpeed > 0) {
+    digitalWrite(IN_1_D, HIGH);
+    digitalWrite(IN_2_D, LOW);
+  } else if (rightSpeed < 0) {
+    digitalWrite(IN_1_D, LOW);
+    digitalWrite(IN_2_D, HIGH);
+  } else {
+    digitalWrite(IN_1_D, LOW);
+    digitalWrite(IN_2_D, LOW);
+  }
+  analogWrite(EN_D, abs(rightSpeed));
+}
+
+void stopMotors() {
+  setMotorSpeed(0, 0);
+}
+
+// Fonctions utilitaires
+void resetEncoders() {
+  encoderDCount = 0;
+  encoderGCount = 0;
+}
+
+float getDistanceLeft() {
+  return encoderGCount * CM_PER_PULSE;
+}
+
+float getDistanceRight() {
+  return encoderDCount * CM_PER_PULSE;
+}
+
+float getAverageDistance() {
+  return (getDistanceLeft() + getDistanceRight()) / 2.0;
+}
+
+// Initialisation I2C et capteurs
+void initSensors() {
+  Wire.begin(SDA, SCL);
+  
+  // Initialisation IMU LSM6DS3
+  Wire.beginTransmission(ADDR_IMU);
+  Wire.write(0x10); // CTRL1_XL
+  Wire.write(0x60); // ODR 416 Hz, ±2g
+  if (Wire.endTransmission() != 0) {
+    Serial.println("Erreur initialisation IMU");
+  }
+  
+  // Initialisation magnétomètre LIS3MDL
+  Wire.beginTransmission(ADDR_MAG);
+  Wire.write(0x20); // CTRL_REG1
+  Wire.write(0x70); // Temp enabled, High perf, ODR 10 Hz
+  if (Wire.endTransmission() != 0) {
+    Serial.println("Erreur initialisation magnetometre");
+  }
+  
+  Wire.beginTransmission(ADDR_MAG);
+  Wire.write(0x22); // CTRL_REG3
+  Wire.write(0x00); // Continuous mode
+  Wire.endTransmission();
+}
+
+// Lecture du magnétomètre
+float readMagnetometer() {
+  Wire.beginTransmission(ADDR_MAG);
+  Wire.write(0x28 | 0x80); // OUT_X_L avec auto-increment
+  Wire.endTransmission();
+  Wire.requestFrom(ADDR_MAG, 6);
+  
+  if (Wire.available() >= 6) {
+    int16_t magX = Wire.read() | (Wire.read() << 8);
+    int16_t magY = Wire.read() | (Wire.read() << 8);
+    int16_t magZ = Wire.read() | (Wire.read() << 8);
+    
+    // Calcul de l'angle du nord magnétique
+    float heading = atan2(magY, magX) * 180.0 / PI;
+    if (heading < 0) heading += 360.0;
+    
+    return heading;
+  }
+  return 0.0;
+}
+
+// Avancer en ligne droite avec contrôle simple
+void moveForwardDistance(float targetDistance) {
+  resetEncoders();
+  Serial.print("Avancement de ");
+  Serial.print(targetDistance);
+  Serial.println(" cm");
+  
+  int baseSpeed = 150;
+  setMotorSpeed(baseSpeed, baseSpeed);
+  
+  // Attendre que la distance soit parcourue
+  while (getAverageDistance() < targetDistance) {
+    // Petit correctif pour maintenir la ligne droite
+    float leftDist = getDistanceLeft();
+    float rightDist = getDistanceRight();
+    float diff = leftDist - rightDist;
+    
+    int correction = diff * 5; // Facteur de correction simple
+    correction = constrain(correction, -30, 30);
+    
+    setMotorSpeed(baseSpeed - correction, baseSpeed + correction);
+    delay(10);
+  }
+  
+  stopMotors();
+  Serial.print("Distance reelle: ");
+  Serial.print(getAverageDistance());
+  Serial.println(" cm");
+}
+
+// Tourner d'un angle donné (positif = gauche, négatif = droite)
+void turnAngle(float targetAngle) {
+  resetEncoders();
+  Serial.print("Rotation de ");
+  Serial.print(targetAngle);
+  Serial.println(" degres");
+  
+  // Calcul de la distance que chaque roue doit parcourir
+  float arcLength = abs(targetAngle) * PI / 180.0 * (WHEEL_BASE / 2.0);
+  
+  int turnSpeed = 120;
+  
+  if (targetAngle > 0) { // Tourner à gauche
+    setMotorSpeed(-turnSpeed, turnSpeed);
+    while (getDistanceRight() < arcLength) {
+      delay(10);
+    }
+  } else { // Tourner à droite
+    setMotorSpeed(turnSpeed, -turnSpeed);
+    while (getDistanceLeft() < arcLength) {
+      delay(10);
+    }
+  }
+  
+  stopMotors();
+  Serial.println("Rotation terminee");
+}
+
+// SÉQUENCE 1: L'escalier
+void executeSequence1() {
+  Serial.println("\n=== DEBUT SEQUENCE 1: L'ESCALIER ===");
+  isExecuting = true;
+  
+  // Avancer de 20 cm
+  moveForwardDistance(20.0);
+  delay(1000);
+  
+  // Tourner de 90 degres vers la gauche
+  turnAngle(90.0);
+  delay(1000);
+  
+  // Avancer de 10 cm
+  moveForwardDistance(10.0);
+  delay(1000);
+  
+  // Tourner de 90 degres vers la droite
+  turnAngle(-90.0);
+  delay(1000);
+  
+  // Avancer de 40 cm
+  moveForwardDistance(40.0);
+  
+  isExecuting = false;
+  Serial.println("=== FIN SEQUENCE 1 ===");
+}
+
+// SÉQUENCE 2: Le cercle
+void executeSequence2(float radius) {
+  Serial.println("\n=== DEBUT SEQUENCE 2: TEST ENCODEUR ===");
+  isExecuting = true;
+  
+  // Réinitialisation des encodeurs
+  resetEncoders();
+  
+  // Sauvegarde de la position initiale
+  long initialGCount = encoderGCount;
+  
+  // Faire tourner lentement la roue gauche
+  setMotorSpeed(50, 0);  // Vitesse faible pour la roue gauche seulement
+  
+  // Attendre un tic d'encodeur
+  while (encoderGCount <= initialGCount + 1 && isExecuting) {
+    Serial.print("Encodeur G: ");
+    Serial.println(encoderGCount);
+    delay(10);
+  }
+  
+  // Arrêt immédiat
+  stopMotors();
+  
+  // Affichage des résultats
+  Serial.println("\nRésultats du test:");
+  Serial.print("Tics encodeur gauche: ");
+  Serial.println(encoderGCount - initialGCount);
+  
+  isExecuting = false;
+  Serial.println("=== FIN SEQUENCE 2 ===");
+}
+
+// SÉQUENCE 3: Flèche vers le nord
+void executeSequence3() {
+  Serial.println("\n=== DEBUT SEQUENCE 3: FLECHE VERS LE NORD ===");
+  isExecuting = true;
+  
+  // Lire la direction du nord magnétique
+  float currentHeading = readMagnetometer();
+  Serial.print("Cap actuel: ");
+  Serial.print(currentHeading);
+  Serial.println(" deg");
+  
+  // Se tourner vers le nord (0 degrés)
+  float angleDiff = 0.0 - currentHeading;
+  
+  // Normaliser l'angle entre -180 et 180
+  while (angleDiff > 180) angleDiff -= 360;
+  while (angleDiff < -180) angleDiff += 360;
+  
+  if (abs(angleDiff) > 5.0) {
+    Serial.print("Rotation vers le nord: ");
+    Serial.print(angleDiff);
+    Serial.println(" deg");
+    turnAngle(angleDiff);
+    delay(500);
+  }
+  
+  // Dessiner la flèche - Corps principal (4 cm)
+  moveForwardDistance(4.0);
+  delay(300);
+  
+  // Première pointe de la flèche
+  turnAngle(135.0);
+  delay(300);
+  moveForwardDistance(1.5);
+  delay(300);
+  
+  // Retour au sommet
+  turnAngle(180.0);
+  delay(300);
+  moveForwardDistance(1.5);
+  delay(300);
+  
+  // Deuxième pointe de la flèche
+  turnAngle(-90.0);
+  delay(300);
+  moveForwardDistance(1.5);
+  delay(300);
+  
+  // Retour au sommet et remplissage
+  turnAngle(180.0);
+  delay(300);
+  moveForwardDistance(1.5);
+  delay(300);
+  
+  // Remplissage simple du triangle
+  for (int i = 0; i < 5; i++) {
+    turnAngle(30.0);
+    moveForwardDistance(0.2);
+    turnAngle(-60.0);
+    moveForwardDistance(0.2);
+    turnAngle(30.0);
+  }
+  
+  isExecuting = false;
+  Serial.println("=== FIN SEQUENCE 3 ===");
+}
+
+// Interface web
+void handleRoot() {
+  String html = "<!DOCTYPE html>"
+    "<html><head>"
+    "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
+    "<title>DrawBot Control</title>"
+    "<style>"
+    "body{font-family:Arial,sans-serif;text-align:center;margin:20px;}"
+    ".sequence{margin:20px;padding:15px;border:1px solid #ccc;border-radius:10px;}"
+    ".btn{padding:10px 20px;margin:10px;font-size:16px;cursor:pointer;}"
+    ".btn:hover{background-color:#f0f0f0;}"
+    "input{padding:5px;margin:5px;text-align:center;}"
+    ".status{margin:10px;padding:10px;background-color:#f9f9f9;border-radius:5px;}"
+    "</style></head><body>"
+    "<h1>DrawBot Control Panel</h1>"
+    "<div class='status'><h3>Etat: <span id='status'>Pret</span></h3></div>"
+    "<div class='sequence'>"
+    "<h3>Sequence 1: L'Escalier</h3>"
+    "<p>Parcours: 20cm -> gauche 90deg -> 10cm -> droite 90deg -> 40cm</p>"
+    "<button class='btn' onclick='executeSequence(1)'>Executer Sequence 1</button>"
+    "</div>"
+    "<div class='sequence'>"
+    "<h3>Sequence 2: Le Cercle</h3>"
+    "<p>Rayon: <input type='number' id='radius' value='10' min='2' max='20'> cm</p>"
+    "<button class='btn' onclick='executeSequence(2)'>Dessiner Cercle</button>"
+    "</div>"
+    "<div class='sequence'>"
+    "<h3>Sequence 3: Fleche vers le Nord</h3>"
+    "<p>Dessine une fleche pointant vers le nord magnetique</p>"
+    "<button class='btn' onclick='executeSequence(3)'>Dessiner Fleche Nord</button>"
+    "</div>"
+    "<div class='sequence'>"
+    "<h3>Controles d'urgence</h3>"
+    "<button class='btn' onclick='stopRobot()' style='background-color:#ff6b6b;color:white;'>ARRET D'URGENCE</button>"
+    "<button class='btn' onclick='resetRobot()'>Reset Position</button>"
+    "</div>"
+    "<script>"
+    "function executeSequence(seq){"
+    "document.getElementById('status').textContent='Execution en cours...';"
+    "let url='/execute?seq='+seq;"
+    "if(seq===2){"
+    "let radius=document.getElementById('radius').value;"
+    "url+='&radius='+radius;"
+    "}"
+    "fetch(url).then(response=>response.text()).then(data=>{"
+    "console.log(data);"
+    "setTimeout(()=>{"
+    "document.getElementById('status').textContent='Pret';"
+    "},8000);"
+    "});"
+    "}"
+    "function stopRobot(){"
+    "fetch('/stop');"
+    "document.getElementById('status').textContent='Arrete';"
+    "}"
+    "function resetRobot(){"
+    "fetch('/reset');"
+    "document.getElementById('status').textContent='Position reinitialise';"
+    "}"
+    "setInterval(()=>{"
+    "fetch('/status').then(response=>response.text()).then(status=>{"
+    "if(!status.includes('Execution')){"
+    "document.getElementById('status').textContent=status;"
+    "}"
+    "});"
+    "},2000);"
+    "</script></body></html>";
+  
+  server.send(200, "text/html", html);
+}
+
+void handleExecute() {
+  int seq = server.arg("seq").toInt();
+  
+  if (isExecuting) {
+    server.send(200, "text/plain", "Robot occupe");
+    return;
+  }
+  
+  switch (seq) {
+    case 1:
+      server.send(200, "text/plain", "Execution sequence 1 demarree");
+      executeSequence1();
+      break;
+    case 2: {
+      int radius = server.arg("radius").toInt();
+      radius = constrain(radius, 2, 20);
+      server.send(200, "text/plain", "Execution sequence 2 demarree - Rayon: " + String(radius) + "cm");
+      executeSequence2(radius);
+      break;
+    }
+    case 3:
+      server.send(200, "text/plain", "Execution sequence 3 demarree");
+      executeSequence3();
+      break;
+    default:
+      server.send(400, "text/plain", "Sequence invalide");
+  }
+}
+
+void handleStop() {
+  isExecuting = false;
+  stopMotors();
+  server.send(200, "text/plain", "Robot arrete");
+}
+
+void handleReset() {
+  resetEncoders();
+  server.send(200, "text/plain", "Position reinitialisee");
+}
+
+void handleStatus() {
+  if (isExecuting) {
+    server.send(200, "text/plain", "Execution en cours");
+  } else {
+    server.send(200, "text/plain", "Pret");
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  Serial.println("\n=== DRAWBOT v2.1 - CORRIGE ===");
+  
+  // Configuration des pins
+  pinMode(LEDU1, OUTPUT);
+  pinMode(LEDU2, OUTPUT);
+  pinMode(EN_D, OUTPUT);
+  pinMode(EN_G, OUTPUT);
+  pinMode(IN_1_D, OUTPUT);
+  pinMode(IN_2_D, OUTPUT);
+  pinMode(IN_1_G, OUTPUT);
+  pinMode(IN_2_G, OUTPUT);
+  
+  // Configuration encodeurs
+  pinMode(ENC_D_CH_A, INPUT_PULLUP);
+  pinMode(ENC_D_CH_B, INPUT_PULLUP);
+  pinMode(ENC_G_CH_A, INPUT_PULLUP);
+  pinMode(ENC_G_CH_B, INPUT_PULLUP);
+  
+  // Interruptions encodeurs
+  attachInterrupt(digitalPinToInterrupt(ENC_D_CH_A), encoderDISR, RISING);
+  attachInterrupt(digitalPinToInterrupt(ENC_G_CH_A), encoderGISR, RISING);
+  
+  // Initialisation capteurs
+  initSensors();
+  delay(500);
+  
+  // Initialisation Bluetooth
+  SerialBT.begin("DrawBot-ESP32");
+  Serial.println("Bluetooth initialise: DrawBot-ESP32");
+  
+  // Initialisation WiFi
+  WiFi.softAP(ssid, password);
+  Serial.print("WiFi AP cree: ");
+  Serial.println(ssid);
+  Serial.print("IP: ");
+  Serial.println(WiFi.softAPIP());
+  
+  // Configuration serveur web
+  server.on("/", handleRoot);
+  server.on("/execute", handleExecute);
+  server.on("/stop", handleStop);
+  server.on("/reset", handleReset);
+  server.on("/status", handleStatus);
+  server.begin();
+  
+  // LEDs de statut
+  digitalWrite(LEDU1, HIGH);
+  digitalWrite(LEDU2, HIGH);
+  
+  stopMotors();
+  
+  Serial.println("DrawBot pret pour les 3 sequences!");
+  Serial.println("Interface web: http://192.168.4.1");
+  
+  // Test rapide des encodeurs
+  Serial.println("Test encodeurs - bougez les roues manuellement");
+}
+
+void loop() {
+  // Gestion serveur web
+  server.handleClient();
+  
+  // Gestion commandes Bluetooth
+  if (SerialBT.available()) {
+    String command = SerialBT.readString();
+    command.trim();
+    
+    Serial.print("Commande BT: ");
+    Serial.println(command);
+    
+    if (command == "SEQ1") {
+      executeSequence1();
+    } else if (command.startsWith("SEQ2:")) {
+      int radius = command.substring(5).toInt();
+      radius = constrain(radius, 2, 20);
+      executeSequence2(radius);
+    } else if (command == "SEQ3") {
+      executeSequence3();
+    } else if (command == "STOP") {
+      isExecuting = false;
+      stopMotors();
+    } else if (command == "TEST") {
+      // Test simple des moteurs
+      Serial.println("Test moteurs");
+      setMotorSpeed(100, 100);
+      delay(1000);
+      stopMotors();
+    }
+  }
+  
+  // LED de statut
+  static unsigned long lastBlink = 0;
+  if (millis() - lastBlink > 1000) {
+    digitalWrite(LEDU1, !digitalRead(LEDU1));
+    lastBlink = millis();
+    
+    // Debug encodeurs occasionnel
+    if (!isExecuting && encoderDCount > 0 && encoderGCount > 0) {
+      Serial.print("Encodeurs - D: ");
+      Serial.print(encoderDCount);
+      Serial.print(" G: ");
+      Serial.println(encoderGCount);
+    }
+  }
+  
+  delay(10);
+}
